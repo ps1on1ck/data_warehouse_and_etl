@@ -1,5 +1,4 @@
 # Building a Data Warehouse and ETL Foundations
-Building a Data Warehouse and ETL Foundations
 `DWH` `ETL` `Data Vault` `Anchor Modeling` `MPP` `Data Quality` `Apache Airflow` `Python` `Docker` `PostgreSQL`
 
 ### Lesson 4
