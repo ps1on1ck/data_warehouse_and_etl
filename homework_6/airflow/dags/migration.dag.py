@@ -1,43 +1,45 @@
 from datetime import datetime
 from airflow import DAG
-from airflow.operators.postgres_operator import PostgresOperator
 from airflow.operators.python_operator import PythonOperator
-from airflow.hooks.postgres_hook import PostgresHook
-# from migration import MigrationAirflow # ModuleNotFoundError: No module named 'migration'
-import os
+from migration import MigrationAirflow
+import json
 
-migration_tables = ['NATION', 'REGION', 'PART', 'SUPPLIER', 'PARTSUPP', 'CUSTOMER', 'ORDERS', 'LINEITEM']
-
-def dump_data(**kwargs):
-    conn_string_id = "postgres_source"
-    # db_migration = MigrationAirflow(conn_string_id)
-    # db_migration.download_data_by_tables(migration_tables)
-    result_folder="results"
-    phook = PostgresHook(postgres_conn_id=conn_string_id)
-    conn = phook.get_conn()
-    with conn.cursor() as cursor:
-        for table in migration_tables:
-            q = f"COPY {table} TO STDOUT WITH DELIMITER ',' CSV HEADER;"
-            filename = f"./{result_folder}/{table}.csv"
-            os.makedirs(os.path.dirname(filename), exist_ok=True)
-            with open(filename, 'w', encoding='utf-8') as f:
-                cursor.copy_expert(q, f)
+migration_store_name = "migrations"
 
 
-def load_data(**kwargs):
-    conn_string_id = "postgres_target"
-    # db_migration = MigrationAirflow(conn_string_id)
-    # db_migration.load_data_by_tables(migration_tables)
-    # db_migration.check_loaded_data_by_tables(migration_tables)
-    result_folder="results"
-    phook = PostgresHook(postgres_conn_id=conn_string_id)
-    conn = phook.get_conn()
-    with conn.cursor() as cursor:
-        for table in migration_tables:
-            q = f"COPY {table} from STDIN WITH DELIMITER ',' CSV HEADER;"
-            filename = f"./{result_folder}/{table}.csv"
-            with open(filename, 'r', encoding='utf-8') as f:
-                cursor.copy_expert(q, f)
+def init_storage(**context):
+    context['ti'].xcom_push(key=migration_store_name, value={})
+
+
+def dump_data(conn_string_id, migration_name, **context):
+    migration_tables = ['NATION', 'REGION', 'PART', 'SUPPLIER', 'PARTSUPP', 'CUSTOMER', 'ORDERS', 'LINEITEM']
+    db_migration = MigrationAirflow(conn_string_id)
+    data = db_migration.download_data_by_tables(migration_tables)
+    migrations = context['ti'].xcom_pull(key=migration_store_name)
+    migrations[migration_name] = {'source': conn_string_id, 'timestamp': str(datetime.now()), 'data': []}
+    migrations[migration_name]['data'] = data
+    context['ti'].xcom_push(key=migration_store_name, value=migrations)
+
+
+def load_data(conn_string_id, migration_name, **context):
+    migrations = context['ti'].xcom_pull(key=migration_store_name)
+    migration = migrations[migration_name]
+
+    db_migration = MigrationAirflow(conn_string_id)
+    db_migration.load_data_by_tables(migration['data'])
+    db_migration.check_loaded_data_by_tables(migration['data'])
+
+
+def print_all_data(**context):
+    print(json.dumps(context['ti'].xcom_pull(key=migration_store_name), indent=4, sort_keys=True))
+
+
+def remove_files(migration_name, **context):
+    migrations = context['ti'].xcom_pull(key=migration_store_name)
+    migration = migrations[migration_name]
+    file_list = [k['filename'] for k in migration['data']]
+    print(file_list)
+    MigrationAirflow.remove_files(file_list)
 
 
 DEFAULT_ARGS = {
@@ -56,20 +58,46 @@ with DAG(
         tags=['data-flow'],
         catchup=False
 ) as dag:
+    init_storage = PythonOperator(
+        task_id="init_storage",
+        python_callable=init_storage,
+        provide_context=True
+    )
+
     dump_data = PythonOperator(
         task_id='dump_my_data',
-        python_callable=dump_data
+        python_callable=dump_data,
+        op_args=["postgres_source", "migration_v1"],
+        xcom_pull=True,
+        provide_context=True
     )
 
     load_data = PythonOperator(
         task_id='load_my_data',
-        python_callable=load_data
+        python_callable=load_data,
+        op_args=["postgres_target", "migration_v1"],
+        xcom_pull=True,
+        provide_context=True
     )
 
-#    insert_my_data = PostgresOperator(
-#            task_id='insert_my_data',
-#            postgres_conn_id='postgres_target',
-#            sql="INSERT INTO nation VALUES (17, 'name', 7, 'comment')"
-#        )
+    print_result = PythonOperator(
+        task_id="print_result",
+        python_callable=print_all_data,
+        provide_context=True
+    )
 
-    dump_data >> load_data
+    remove_files = PythonOperator(
+        task_id="remove_files",
+        python_callable=remove_files,
+        op_args=["migration_v1"],
+        xcom_pull=True,
+        provide_context=True
+    )
+
+    #    insert_my_data = PostgresOperator(
+    #            task_id='insert_my_data',
+    #            postgres_conn_id='postgres_target',
+    #            sql="INSERT INTO nation VALUES (17, 'name', 7, 'comment')"
+    #        )
+
+    init_storage >> dump_data >> load_data >> print_result >> remove_files
